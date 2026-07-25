@@ -1,1 +1,91 @@
+name: Build Pajero firmware
 
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pajero_node.ino'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Find pajero_node.ino
+        id: find
+        run: |
+          SKETCH=$(find . -name 'pajero_node.ino' -type f | head -n1)
+          if [ -z "$SKETCH" ]; then
+            echo "ERROR: pajero_node.ino not found in repo"
+            exit 1
+          fi
+          SKETCH_DIR=$(dirname "$SKETCH")
+          echo "sketch=$SKETCH"
+          echo "dir=$SKETCH_DIR"
+          echo "sketch_path=$SKETCH" >> "$GITHUB_OUTPUT"
+          echo "sketch_dir=$SKETCH_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core + libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.0.7
+          arduino-cli lib install "PubSubClient" "ArduinoJson"
+          # TinyGSM fork (lewisxhe version with SIM7672 support)
+          arduino-cli lib install --git-url https://github.com/lewisxhe/TinyGSM-fork.git || true
+
+      - name: Compile
+        run: |
+          SKETCH_DIR="${{ steps.find.outputs.sketch_dir }}"
+          echo "Compiling from directory: $SKETCH_DIR"
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:PartitionScheme=default_16MB,PSRAM=opi,FlashSize=16M \
+            --export-binaries \
+            "$SKETCH_DIR"
+
+      - name: Locate and hash the .bin
+        id: bin
+        run: |
+          BIN=$(find . -name 'pajero_node.ino.bin' -type f | head -n1)
+          if [ -z "$BIN" ]; then
+            echo "ERROR: compiled .bin not found"
+            exit 1
+          fi
+          cp "$BIN" pajero_node.bin
+          SHA=$(sha256sum pajero_node.bin | cut -d' ' -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "### Firmware built" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "SHA-256:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh pajero_node.bin >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish as a Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fw-${{ github.run_number }}
+          name: Firmware build ${{ github.run_number }}
+          body: |
+            Automated build from `main`.
+
+            **SHA-256** (paste into the app's Firmware update box):
+            ```
+            ${{ steps.bin.outputs.sha }}
+            ```
+
+            Download `pajero_node.bin` below, copy its URL, and send URL + SHA from the app.
+          files: pajero_node.bin
