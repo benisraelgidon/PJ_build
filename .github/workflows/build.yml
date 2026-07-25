@@ -55,15 +55,19 @@ jobs:
 
       - name: Compile
         run: |
+          echo "=== confirm staged sketch exists ==="
+          ls -l "$GITHUB_WORKSPACE/build_sketch/pajero_node/"
+          echo "=== compiling by absolute path ==="
           arduino-cli compile \
             --fqbn esp32:esp32:esp32s3:PartitionScheme=default_16MB,PSRAM=opi,FlashSize=16M \
             --export-binaries \
-            build_sketch/pajero_node
+            --output-dir "$GITHUB_WORKSPACE/build_out" \
+            "$GITHUB_WORKSPACE/build_sketch/pajero_node"
 
       - name: Locate and hash the .bin
         id: bin
         run: |
-          BIN=$(find . -name 'pajero_node.ino.bin' -type f | head -n1)
+          BIN=$(find "$GITHUB_WORKSPACE/build_out" "$GITHUB_WORKSPACE/build_sketch" -name 'pajero_node.ino.bin' -type f 2>/dev/null | head -n1)
           if [ -z "$BIN" ]; then
             echo "ERROR: compiled .bin not found"
             exit 1
