@@ -18,19 +18,26 @@ jobs:
       - name: Check out the repo
         uses: actions/checkout@v4
 
-      - name: Find pajero_node.ino
+      - name: Find and stage the sketch
         id: find
         run: |
+          echo "===== repo tree ====="
+          find . -not -path './.git/*' -type f | sort
+          echo "====================="
           SKETCH=$(find . -name 'pajero_node.ino' -type f | head -n1)
           if [ -z "$SKETCH" ]; then
-            echo "ERROR: pajero_node.ino not found in repo"
+            echo "ERROR: pajero_node.ino not found anywhere in the repo"
             exit 1
           fi
-          SKETCH_DIR=$(dirname "$SKETCH")
-          echo "sketch=$SKETCH"
-          echo "dir=$SKETCH_DIR"
-          echo "sketch_path=$SKETCH" >> "$GITHUB_OUTPUT"
-          echo "sketch_dir=$SKETCH_DIR" >> "$GITHUB_OUTPUT"
+          echo "Found sketch at: $SKETCH"
+          # Arduino requires the sketch to sit in a folder whose name matches the
+          # .ino (pajero_node.ino must live in a folder called pajero_node).
+          # Copy it into a clean build/pajero_node/ dir so layout is guaranteed.
+          mkdir -p build_sketch/pajero_node
+          cp "$SKETCH" build_sketch/pajero_node/pajero_node.ino
+          echo "Staged at: build_sketch/pajero_node/pajero_node.ino"
+          ls -l build_sketch/pajero_node/
+          echo "sketch_dir=build_sketch/pajero_node" >> "$GITHUB_OUTPUT"
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
@@ -48,12 +55,10 @@ jobs:
 
       - name: Compile
         run: |
-          SKETCH_DIR="${{ steps.find.outputs.sketch_dir }}"
-          echo "Compiling from directory: $SKETCH_DIR"
           arduino-cli compile \
             --fqbn esp32:esp32:esp32s3:PartitionScheme=default_16MB,PSRAM=opi,FlashSize=16M \
             --export-binaries \
-            "$SKETCH_DIR"
+            build_sketch/pajero_node
 
       - name: Locate and hash the .bin
         id: bin
