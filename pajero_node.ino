@@ -193,6 +193,8 @@ bool otaUpdate(const char* url, const char* wantSha);
 void nlog(const char* fmt, ...);
 void cmdCell(); void cmdData(); void cmdHist(); void cmdLocate();
 void histSample();
+void otaProbe(const char* url);
+String httpsGet(const char* url);
 String httpsPost(const char* url, const char* jsonBody);
 #if TG_ENABLE
   TinyGsmClientSecure tgClient(modem, 1);
@@ -317,6 +319,8 @@ bool  lastFixValid = false;
    both. So the MQTT handler only sets a flag; the work happens in loop() after
    mqtt.loop() has returned and the socket is idle. 0=none. */
 volatile char pendingCellCmd = 0;   // 'c'=cell 'd'=data 'h'=hist 'l'=locate
+volatile bool pendingOtaTest = false;
+char          otaTestUrl[300] = "";
 
 /* ---- raw AT: send a command, capture the reply text into buf ----
    TinyGSM has no public sendAT/waitResponse we can rely on across the fork, so
@@ -490,6 +494,31 @@ void cmdHist() {
    Parses "host" and "path" out of an https:// URL, sends a JSON body, returns
    just the response body (headers stripped). Pauses MQTT to free the socket,
    exactly like tgSend does, then lets the main loop reconnect. */
+String httpsGet(const char* url) {
+  const char* h = strstr(url, "://"); if (!h) return String(); h += 3;
+  const char* slash = strchr(h, '/');
+  char host[128]; int hlen = slash ? (int)(slash - h) : (int)strlen(h);
+  if (hlen <= 0 || hlen >= (int)sizeof(host)) return String();
+  memcpy(host, h, hlen); host[hlen] = 0;
+  const char* path = slash ? slash : "/";
+#if TG_PAUSE_MQTT
+  bool hadMqtt = mqtt.connected();
+  if (hadMqtt) { mqtt.disconnect(); netClient.stop(); delay(100); }
+#endif
+  if (!tgClient.connect(host, 443)) { nlog("[https] TLS connect failed to %s", host); return String(); }
+  tgClient.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
+                 "\r\nUser-Agent: pajero\r\nConnection: close\r\n\r\n");
+  String resp; resp.reserve(400); uint32_t t0 = millis();
+  while (millis() - t0 < 15000) {
+    while (tgClient.available()) { char ch = tgClient.read(); if (resp.length() < 800) resp += ch; t0 = millis(); }
+    if (!tgClient.connected() && !tgClient.available()) break;
+    delay(10);
+  }
+  tgClient.stop();
+  int b = resp.indexOf("\r\n\r\n");
+  return b >= 0 ? resp.substring(b + 4) : resp;
+}
+
 String httpsPost(const char* url, const char* jsonBody) {
   const char* h = strstr(url, "://");
   if (!h) return String();
@@ -534,46 +563,66 @@ String httpsPost(const char* url, const char* jsonBody) {
    and a range estimate, or 0,0 / stat:err when the cell isn't in the database. */
 void cmdLocate() {
   CellInfo c = readCell();
-  if (strlen(OCID_TOKEN) == 0) {
-    nlog("[locate] no OCID_TOKEN set - cell geolocation disabled.");
-    if (c.state == 1)
-      nlog("[locate] look up by hand: MCC=%d MNC=%d LAC=%ld CID=%ld", c.mcc, c.mnc, c.tac, c.eci);
-    return;
-  }
   if (!cellUp)                              { nlog("[locate] needs data - modem offline right now"); return; }
   if (c.state != 1 || strcmp(c.rat, "LTE")) { nlog("[locate] no LTE serving cell to look up"); return; }
 
-  // current OpenCellID API: JSON POST. token WITH pk. prefix, lac=TAC, cid=ECI.
-  char body[300];
-  snprintf(body, sizeof(body),
-    "{\"token\":\"%s\",\"radio\":\"lte\",\"mcc\":%d,\"mnc\":%d,"
-    "\"cells\":[{\"lac\":%ld,\"cid\":%ld}],\"address\":1}",
-    OCID_TOKEN, c.mcc, c.mnc, c.tac, c.eci);
+  // Current working endpoint: OpenCellID's own AJAX GET. No token needed, returns
+  // {"lon":"..","lat":"..","range":".."} with values as QUOTED strings.
+  char url[224];
+  snprintf(url, sizeof(url),
+    "https://opencellid.org/ajax/searchCell.php?mcc=%d&mnc=%d&lac=%ld&cellid=%ld",
+    c.mcc, c.mnc, c.tac, c.eci);
 
   nlog("[locate] asking OpenCellID about cell %ld (TAC %ld) ...", c.eci, c.tac);
-  String resp = httpsPost("https://opencellid.org/cell/get", body);
-  if (resp.length() == 0) { nlog("[locate] no response (data? token?)"); return; }
+  String resp = httpsGet(url);
+  if (resp.length() == 0) { nlog("[locate] no response from server"); return; }
 
-  if (resp.indexOf("stat=\"fail\"") >= 0 || resp.indexOf("\"stat\":\"fail\"") >= 0) {
-    // XML error, e.g. API Key not known
-    nlog("[locate] OpenCellID rejected the request. If 'API Key not known', try");
-    nlog("[locate] the token without its pk. prefix. raw: %.70s", resp.c_str());
+  // "false" or missing = cell not in database
+  if (resp.indexOf("false") >= 0 && resp.indexOf("lat") < 0) {
+    nlog("[locate] cell not in the OpenCellID database (common outside towns)");
     return;
   }
   int li = resp.indexOf("\"lat\"");
   int oi = resp.indexOf("\"lon\"");
-  if (li < 0 || oi < 0) { nlog("[locate] cell not in the OpenCellID database"); return; }
-  double lat = atof(resp.c_str() + resp.indexOf(':', li) + 1);
-  double lon = atof(resp.c_str() + resp.indexOf(':', oi) + 1);
+  if (li < 0 || oi < 0) { nlog("[locate] no location in reply"); return; }
+  // values are strings: skip ':' then a quote
+  int lc = resp.indexOf(':', li); int oc = resp.indexOf(':', oi);
+  double lat = atof(resp.c_str() + lc + 2);   // +2 skips :"
+  double lon = atof(resp.c_str() + oc + 2);
   if (lat == 0.0 && lon == 0.0) { nlog("[locate] cell not mapped (0,0)"); return; }
-  int ai = resp.indexOf("\"accuracy\"");
-  double acc = ai >= 0 ? atof(resp.c_str() + resp.indexOf(':', ai) + 1) : -1;
+  int ri = resp.indexOf("\"range\"");
+  double range = ri >= 0 ? atof(resp.c_str() + resp.indexOf(':', ri) + 2) : -1;
 
-  nlog("[locate] ~%.5f, %.5f  (accuracy ~%.0f m - coarse!)", lat, lon, acc);
+  nlog("[locate] tower at %.5f, %.5f  (coverage radius ~%.0f m)", lat, lon, range);
+
+  // Direction + distance from the car's last GPS fix to the tower.
+  if (lastFixValid) {
+    double toR = 3.14159265358979 / 180.0;
+    double y = sin((lon - lastFixLon) * toR) * cos(lat * toR);
+    double x = cos(lastFixLat * toR) * sin(lat * toR) -
+               sin(lastFixLat * toR) * cos(lat * toR) * cos((lon - lastFixLon) * toR);
+    double brg = atan2(y, x) / toR; if (brg < 0) brg += 360;
+    double dlat = (lat - lastFixLat) * toR, dlon = (lon - lastFixLon) * toR;
+    double a = sin(dlat/2)*sin(dlat/2) + cos(lastFixLat*toR)*cos(lat*toR)*sin(dlon/2)*sin(dlon/2);
+    double dist = 6371000.0 * 2 * atan2(sqrt(a), sqrt(1-a));
+    const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+    const char* dir = dirs[(int)((brg + 22.5) / 45.0) % 8];
+    nlog("[locate] tower is %.0f m to your %s (bearing %.0f deg) from last GPS fix", dist, dir, brg);
+  } else {
+    nlog("[locate] (no GPS fix yet, so no heading - tower coords above are absolute)");
+  }
   nlog("[locate] https://maps.google.com/?q=%.5f,%.5f", lat, lon);
-  char jl[160];
-  snprintf(jl, sizeof(jl),
-    "{\"kind\":\"celloc\",\"lat\":%.6f,\"lon\":%.6f,\"range\":%.0f}", lat, lon, acc);
+
+  // structured payload for the app map: tower point + coverage radius + car heading
+  char jl[220];
+  if (lastFixValid) {
+    snprintf(jl, sizeof(jl),
+      "{\"kind\":\"celloc\",\"lat\":%.6f,\"lon\":%.6f,\"range\":%.0f,\"clat\":%.6f,\"clon\":%.6f}",
+      lat, lon, range, lastFixLat, lastFixLon);
+  } else {
+    snprintf(jl, sizeof(jl),
+      "{\"kind\":\"celloc\",\"lat\":%.6f,\"lon\":%.6f,\"range\":%.0f}", lat, lon, range);
+  }
   if (mqtt.connected()) mqtt.publish(topicCell, jl);
 }
 
@@ -841,6 +890,12 @@ void onMessage(char* topic, byte* payload, unsigned int len) {
     tgSend("Pajero node: Telegram test OK");
   }
   else if (!strcmp(cmd, "ver"))    { nlog("[ver] fw %s  built %s", FW_VERSION, FW_BUILD); }
+  else if (!strcmp(cmd, "otatest")) {
+    // probe an OTA URL WITHOUT flashing: reports connect + HTTP status + size.
+    const char* u = doc["url"] | "";
+    if (!u[0]) { nlog("[otatest] give a url field"); }
+    else       { pendingOtaTest = true; snprintf(otaTestUrl, sizeof(otaTestUrl), "%s", u); }
+  }
   else if (!strcmp(cmd, "cell"))   { pendingCellCmd = 'c'; }   // deferred: see note at flag
   else if (!strcmp(cmd, "data"))   { pendingCellCmd = 'd'; }
   else if (!strcmp(cmd, "hist"))   { pendingCellCmd = 'h'; }
@@ -1191,6 +1246,70 @@ static void hexOf(const uint8_t* h, char* out65) {
 }
 
 /* Returns true only if the new image was written AND verified. */
+/* otaProbe: exercise the exact download path (connect, TLS, HTTP headers,
+   redirects) and REPORT what happens, without ever touching flash. This is the
+   tool for debugging an OTA that fails before flashing -- run `otatest` with a
+   url and read the Node log. Safe to run anytime; it only reads. */
+void otaProbe(const char* url) {
+  char urlbuf[300]; snprintf(urlbuf, sizeof(urlbuf), "%s", url);
+  bool secure; char host[128]; uint16_t port; char path[200];
+  int redirects = 0;
+
+  nlog("[otatest] probing %s", url);
+  bool hadMqtt = mqtt.connected();
+  if (hadMqtt) { mqtt.disconnect(); netClient.stop(); delay(100); }
+
+  while (redirects <= 3) {
+    if (!splitUrl(urlbuf, &secure, host, sizeof(host), &port, path, sizeof(path))) {
+      nlog("[otatest] bad url"); break;
+    }
+    nlog("[otatest] host=%s port=%d %s path=%s", host, (int)port, secure ? "TLS" : "plain", path);
+    Client* c = secure ? (Client*)&tgClient : (Client*)&netClient;
+
+    uint32_t tc = millis();
+    if (!c->connect(host, port)) {
+      nlog("[otatest] CONNECT FAILED after %lums - host unreachable or TLS refused",
+           (unsigned long)(millis() - tc));
+      break;
+    }
+    nlog("[otatest] connected in %lums", (unsigned long)(millis() - tc));
+
+    c->print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
+             "\r\nUser-Agent: pajero-node\r\nConnection: close\r\n\r\n");
+
+    int status = 0; long length = -1; char loc[256] = ""; long seen = 0;
+    String line; bool done = false; uint32_t t0 = millis();
+    while (!done && millis() - t0 < 25000) {
+      if (c->available()) {
+        char ch = c->read(); t0 = millis(); seen++;
+        if (ch == '\n') {
+          line.trim();
+          if (!line.length()) { done = true; break; }
+          if (!status && line.startsWith("HTTP/")) status = line.substring(line.indexOf(' ')+1, line.indexOf(' ')+4).toInt();
+          if (line.startsWith("Content-Length:")) length = line.substring(15).toInt();
+          if (line.startsWith("Location:")) snprintf(loc, sizeof(loc), "%s", line.substring(9).c_str());
+          line = "";
+        } else if (ch != '\r') line += ch;
+      } else { if (!c->connected() && seen > 0) break; delay(20); }
+    }
+    c->stop();
+
+    if (seen == 0) { nlog("[otatest] 0 BYTES back -> TLS handshake failed to %s", host); break; }
+    nlog("[otatest] HTTP %d, %ld header bytes, content-length=%ld", status, seen, length);
+    if (status >= 300 && status < 400 && loc[0]) {
+      nlog("[otatest] redirect -> %s", loc);
+      if (!strncmp(loc, "http", 4)) snprintf(urlbuf, sizeof(urlbuf), "%s", loc);
+      else snprintf(urlbuf, sizeof(urlbuf), "%s://%s%s", secure ? "https" : "http", host, loc);
+      redirects++; continue;
+    }
+    if (status == 200 && length > 0) nlog("[otatest] OK - download path works, %ld bytes ready", length);
+    else nlog("[otatest] final status %d (expected 200 with a length)", status);
+    break;
+  }
+  if (redirects > 3) nlog("[otatest] too many redirects");
+  nlog("[otatest] done (no flash written). MQTT will reconnect.");
+}
+
 bool otaUpdate(const char* url, const char* wantSha) {
   if (!wantSha || strlen(wantSha) != 64) {
     nlog("[ota] refused - need a 64-char sha256");
@@ -1205,7 +1324,7 @@ bool otaUpdate(const char* url, const char* wantSha) {
   char     host[96], path[160];
   uint16_t port = 443;
 
-  Serial.println("[ota] pausing MQTT for the download");
+  nlog("[ota] starting: pausing MQTT for the download");
   mqtt.disconnect();
   netClient.stop();
   delay(150);
@@ -1218,7 +1337,7 @@ bool otaUpdate(const char* url, const char* wantSha) {
     if (!splitUrl(urlbuf, &secure, host, sizeof(host), &port, path, sizeof(path))) {
       snprintf(result, sizeof(result), "[ota] bad url"); break;
     }
-    Serial.printf("[ota] GET %s%s (%s)\n", host, path, secure ? "https" : "http");
+    nlog("[ota] GET %s%s (%s)", host, path, secure ? "https" : "http");
 
     Client* c;
     if (secure) c = &tgClient;               // reuse the mux-1 TLS socket
@@ -1233,31 +1352,52 @@ bool otaUpdate(const char* url, const char* wantSha) {
              "Connection: close\r\n\r\n");
 
     // ---- headers ----
+    // Wait for the response. On the SIM7670G TLS mux, c->connected() can read
+    // false for a moment right after connect() while c->available() is still 0,
+    // so we must NOT bail the instant the socket looks idle -- only give up when
+    // the full timeout elapses with zero bytes ever received. Otherwise a slow
+    // first byte (common on GitHub's redirect) looks like "HTTP 0".
     int      status = 0;
     long     length = -1;
     char     location[256] = "";
     uint32_t t0 = millis();
     String   line;
     bool     headersDone = false;
+    long     bytesSeen = 0;
 
-    while (!headersDone && millis() - t0 < 20000) {
-      while (c->available()) {
-        char ch = c->read(); t0 = millis();
-        if (ch == '\n') {
-          line.trim();
-          if (line.length() == 0) { headersDone = true; break; }
-          if (!status && line.startsWith("HTTP/")) {
-            int sp = line.indexOf(' ');
-            status = line.substring(sp + 1, sp + 4).toInt();
-          }
-          if (line.startsWith("Content-Length:")) length = line.substring(15).toInt();
-          if (line.startsWith("Location:"))
-            snprintf(location, sizeof(location), "%s", line.substring(9).c_str());
-          line = "";
-        } else if (ch != '\r') line += ch;
+    while (!headersDone && millis() - t0 < 25000) {
+      int avail = c->available();
+      if (avail > 0) {
+        while (c->available()) {
+          char ch = c->read(); t0 = millis(); bytesSeen++;
+          if (ch == '\n') {
+            line.trim();
+            if (line.length() == 0) { headersDone = true; break; }
+            if (!status && line.startsWith("HTTP/")) {
+              int sp = line.indexOf(' ');
+              status = line.substring(sp + 1, sp + 4).toInt();
+            }
+            if (line.startsWith("Content-Length:")) length = line.substring(15).toInt();
+            if (line.startsWith("Location:"))
+              snprintf(location, sizeof(location), "%s", line.substring(9).c_str());
+            line = "";
+          } else if (ch != '\r') line += ch;
+        }
+      } else {
+        // only give up if the socket is truly closed AND we already got data
+        if (!c->connected() && bytesSeen > 0 && c->available() == 0) break;
+        delay(20);
       }
-      if (!c->connected() && !c->available()) break;
-      delay(5);
+    }
+    if (bytesSeen == 0) {
+      c->stop();
+      nlog("[ota] DIAG: connected=%d but 0 bytes in 25s from %s:%d (%s)",
+           (int)c->connected(), host, (int)port, secure ? "TLS" : "plain");
+      nlog("[ota] DIAG: this is a TLS-handshake or server-response failure, not a URL problem");
+      nlog("[ota] DIAG: Telegram uses the same TLS path - if TG works but this doesn't, it's GitHub-specific");
+      snprintf(result, sizeof(result),
+               "[ota] no response from %s (see DIAG lines above)", host);
+      break;
     }
 
     if (status >= 300 && status < 400 && location[0]) {
@@ -1265,7 +1405,7 @@ bool otaUpdate(const char* url, const char* wantSha) {
       // Location may be relative
       if (!strncmp(location, "http", 4)) snprintf(urlbuf, sizeof(urlbuf), "%s", location);
       else snprintf(urlbuf, sizeof(urlbuf), "%s://%s%s", secure ? "https" : "http", host, location);
-      Serial.printf("[ota] redirect %d -> following\n", status);
+      nlog("[ota] redirect %d -> %s", status, location);
       redirects++;
       continue;
     }
@@ -1277,7 +1417,7 @@ bool otaUpdate(const char* url, const char* wantSha) {
       c->stop();
       snprintf(result, sizeof(result), "[ota] no Content-Length"); break;
     }
-    Serial.printf("[ota] %ld bytes incoming\n", length);
+    nlog("[ota] %ld bytes incoming", length);
 
     if (!Update.begin((size_t)length)) {
       c->stop();
@@ -1303,7 +1443,7 @@ bool otaUpdate(const char* url, const char* wantSha) {
         mbedtls_md_update(&md, buf, n);
         got += n;
         int pct = (int)(got * 100 / length);
-        if (pct >= lastPct + 10) { lastPct = pct; Serial.printf("[ota] %d%%\n", pct); }
+        if (pct >= lastPct + 10) { lastPct = pct; nlog("[ota] %d%% (%ld/%ld)", pct, got, length); }
       } else {
         if (!c->connected() && !c->available()) break;
         delay(5);
@@ -1323,7 +1463,7 @@ bool otaUpdate(const char* url, const char* wantSha) {
     }
     if (strcasecmp(hex, wantSha) != 0) {
       Update.abort();
-      Serial.printf("[ota] got  %s\n[ota] want %s\n", hex, wantSha);
+      nlog("[ota] got  %s", hex); nlog("[ota] want %s", wantSha);
       snprintf(result, sizeof(result), "[ota] SHA MISMATCH - update discarded");
       break;
     }
@@ -1340,6 +1480,7 @@ bool otaUpdate(const char* url, const char* wantSha) {
     snprintf(result, sizeof(result), "[ota] too many redirects");
 
   Serial.println(result);
+  nlog("%s", result);          // mirror outcome to app Node log
   snprintf(tgPending, sizeof(tgPending), "%s", result);
 
   if (ok) {
@@ -1941,6 +2082,7 @@ void loop() {
     else if (c == 'h') cmdHist();
     else if (c == 'l') cmdLocate();
   }
+  if (pendingOtaTest) { pendingOtaTest = false; otaProbe(otaTestUrl); }
 #if CAN_ENABLE
   canLoop();
 #endif
