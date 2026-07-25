@@ -48,7 +48,24 @@ jobs:
           arduino-cli config add board_manager.additional_urls \
             https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.0.7
+
+          # The esp32 core pulls a ~250MB toolchain from GitHub's asset server,
+          # which intermittently resets the connection. Retry up to 4 times.
+          n=0
+          until [ $n -ge 4 ]; do
+            if arduino-cli core install esp32:esp32@3.0.7; then
+              echo "core installed"
+              break
+            fi
+            n=$((n+1))
+            echo "core install failed (attempt $n) - retrying in 15s..."
+            sleep 15
+          done
+          if [ $n -ge 4 ]; then
+            echo "ERROR: esp32 core failed to install after 4 attempts"
+            exit 1
+          fi
+
           arduino-cli lib install "PubSubClient" "ArduinoJson"
           # TinyGSM fork (lewisxhe version with SIM7672 support)
           arduino-cli lib install --git-url https://github.com/lewisxhe/TinyGSM-fork.git || true
