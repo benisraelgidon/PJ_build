@@ -380,15 +380,21 @@ CellInfo readCell() {
     c.eci    = strtol(f[4], NULL, 10);
     c.pcid   = strtol(f[5], NULL, 10);
     c.earfcn = strtol(f[7], NULL, 10);
-    c.rsrq   = atoi(f[10]) / 10.0f;
-    c.rsrp   = atoi(f[11]) / 10.0f;
-    c.sinr   = atoi(f[13]) / 10.0f;
+    // SIM7670G LTE layout after EARFCN: RSRP, RSRQ, RSSI, SINR (values in tenths).
+    // (Earlier code was shifted, producing impossible RSRP like -12 dBm.)
+    c.rsrp   = (n > 8)  ? atoi(f[8])  / 10.0f : 0;
+    c.rsrq   = (n > 9)  ? atoi(f[9])  / 10.0f : 0;
+    c.sinr   = (n > 11) ? atoi(f[11]) / 10.0f : 0;
   }
   c.state = 1;
   return c;
 }
 
 void cmdCell() {
+  { char raw[256]; if (rawAT("AT+CPSI?", raw, sizeof(raw))) {
+      // strip to just the +CPSI line, log it verbatim for field verification
+      char* q = strstr(raw, "+CPSI:");
+      if (q) { char* e = strpbrk(q, "\r\n"); if (e) *e = 0; nlog("[cell] RAW %s", q); } } }
   CellInfo c = readCell();
   if (c.state == 0) { nlog("[cell] could not read (modem busy?)"); return; }
   if (c.state == 2) { nlog("[cell] NO SERVICE - not camped on any cell"); return; }
@@ -561,37 +567,56 @@ String httpsPost(const char* url, const char* jsonBody) {
 /* cell-tower geolocation via OpenCellID (free, no billing).
    GET /cell/get with mcc,mnc,lac(=TAC),cellid(=ECI) in DECIMAL. Returns lat/lon
    and a range estimate, or 0,0 / stat:err when the cell isn't in the database. */
+/* parse lat/lon/range out of a geolocation reply. Both OpenCellID's AJAX and
+   Mylnikov return quoted string values; Mylnikov wraps them in a data object and
+   uses result:404 for a miss. Returns true on a real fix. */
+static bool parseGeoReply(const String& resp, double* lat, double* lon, double* range) {
+  if (resp.length() == 0) return false;
+  if (resp.indexOf("\"result\":404") >= 0 || resp.indexOf("404") >= 0) {
+    if (resp.indexOf("\"lat\"") < 0) return false;
+  }
+  int li = resp.indexOf("\"lat\"");
+  int oi = resp.indexOf("\"lon\"");
+  if (li < 0 || oi < 0) return false;
+  double la = atof(resp.c_str() + resp.indexOf(':', li) + 2);
+  double lo = atof(resp.c_str() + resp.indexOf(':', oi) + 2);
+  if (la == 0.0 && lo == 0.0) return false;
+  *lat = la; *lon = lo;
+  int ri = resp.indexOf("\"range\"");
+  *range = ri >= 0 ? atof(resp.c_str() + resp.indexOf(':', ri) + 2) : -1;
+  return true;
+}
+
 void cmdLocate() {
   CellInfo c = readCell();
   if (!cellUp)                              { nlog("[locate] needs data - modem offline right now"); return; }
   if (c.state != 1 || strcmp(c.rat, "LTE")) { nlog("[locate] no LTE serving cell to look up"); return; }
 
-  // Current working endpoint: OpenCellID's own AJAX GET. No token needed, returns
-  // {"lon":"..","lat":"..","range":".."} with values as QUOTED strings.
+  double lat = 0, lon = 0, range = -1;
   char url[224];
+  bool found = false;
+
+  // --- source 1: OpenCellID AJAX ---
   snprintf(url, sizeof(url),
     "https://opencellid.org/ajax/searchCell.php?mcc=%d&mnc=%d&lac=%ld&cellid=%ld",
     c.mcc, c.mnc, c.tac, c.eci);
+  nlog("[locate] trying OpenCellID for cell %ld (TAC %ld) ...", c.eci, c.tac);
+  found = parseGeoReply(httpsGet(url), &lat, &lon, &range);
 
-  nlog("[locate] asking OpenCellID about cell %ld (TAC %ld) ...", c.eci, c.tac);
-  String resp = httpsGet(url);
-  if (resp.length() == 0) { nlog("[locate] no response from server"); return; }
+  // --- source 2: Mylnikov (free, no key) if OpenCellID had nothing ---
+  if (!found) {
+    nlog("[locate] OpenCellID had nothing - trying Mylnikov ...");
+    snprintf(url, sizeof(url),
+      "https://api.mylnikov.org/geolocation/cell?v=1.1&data=open&mcc=%d&mnc=%d&lac=%ld&cellid=%ld",
+      c.mcc, c.mnc, c.tac, c.eci);
+    found = parseGeoReply(httpsGet(url), &lat, &lon, &range);
+  }
 
-  // "false" or missing = cell not in database
-  if (resp.indexOf("false") >= 0 && resp.indexOf("lat") < 0) {
-    nlog("[locate] cell not in the OpenCellID database (common outside towns)");
+  if (!found) {
+    nlog("[locate] neither service knows cell %ld. Enter it by hand in NetMonster", c.eci);
+    nlog("[locate] or cell2gps: MCC=%d MNC=%d LAC=%ld CID=%ld", c.mcc, c.mnc, c.tac, c.eci);
     return;
   }
-  int li = resp.indexOf("\"lat\"");
-  int oi = resp.indexOf("\"lon\"");
-  if (li < 0 || oi < 0) { nlog("[locate] no location in reply"); return; }
-  // values are strings: skip ':' then a quote
-  int lc = resp.indexOf(':', li); int oc = resp.indexOf(':', oi);
-  double lat = atof(resp.c_str() + lc + 2);   // +2 skips :"
-  double lon = atof(resp.c_str() + oc + 2);
-  if (lat == 0.0 && lon == 0.0) { nlog("[locate] cell not mapped (0,0)"); return; }
-  int ri = resp.indexOf("\"range\"");
-  double range = ri >= 0 ? atof(resp.c_str() + resp.indexOf(':', ri) + 2) : -1;
 
   nlog("[locate] tower at %.5f, %.5f  (coverage radius ~%.0f m)", lat, lon, range);
 
